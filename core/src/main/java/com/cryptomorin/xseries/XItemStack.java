@@ -1398,7 +1398,8 @@ public final class XItemStack {
                         break;
                     }
 
-                    XItemFlag.of(flag).ifPresent(itemFlag -> itemFlag.set(meta));
+                    // Flags from a newer version, e.g. HIDE_ADDITIONAL_TOOLTIP on 1.8, have no ItemFlag here.
+                    XItemFlag.of(flag).filter(XItemFlag::isSupported).ifPresent(itemFlag -> itemFlag.set(meta));
                 }
             } else {
                 String allFlags = config.getString("flags");
