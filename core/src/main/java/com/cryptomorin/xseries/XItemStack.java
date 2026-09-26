@@ -58,10 +58,6 @@ import org.bukkit.potion.PotionEffectType;
 import org.bukkit.potion.PotionType;
 import org.jetbrains.annotations.*;
 
-import java.lang.invoke.MethodHandle;
-import java.lang.invoke.MethodHandles;
-import java.lang.invoke.MethodType;
-
 import java.util.*;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
@@ -121,14 +117,6 @@ public final class XItemStack {
             SUPPORTS_ADVANCED_CUSTOM_MODEL_DATA,
             SUPPORTS_ITEM_MODEL,
             SUPPORTS_ITEM_NAME;
-    private static final boolean SUPPORTS_LEGACY_POTION;
-    private static final MethodHandle Potion_fromItemStack;
-    private static final MethodHandle Potion_getType;
-    private static final MethodHandle Potion_getLevel;
-    private static final MethodHandle Potion_hasExtendedDuration;
-    private static final MethodHandle Potion_isSplash;
-    private static final MethodHandle Potion_new;
-    private static final MethodHandle Potion_toItemStack;
 
     static {
         boolean supportsPotionColor = false,
@@ -138,25 +126,6 @@ public final class XItemStack {
                 supportsAdvancedCustomModelData = false,
                 supportsItemModel = false,
                 supportsItemName = false;
-
-        boolean legacyPotionAvailable = false;
-        MethodHandle fromItemStack = null, getType = null, getLevel = null;
-        MethodHandle hasExtendedDuration = null, isSplash = null, toItemStack = null;
-        MethodHandle potionCtor = null;
-
-        try {
-            Class<?> potionClass = Class.forName("org.bukkit.potion.Potion");
-            MethodHandles.Lookup lookup = MethodHandles.lookup();
-            fromItemStack = lookup.findStatic(potionClass, "fromItemStack", MethodType.methodType(potionClass, ItemStack.class));
-            getType = lookup.findVirtual(potionClass, "getType", MethodType.methodType(PotionType.class));
-            getLevel = lookup.findVirtual(potionClass, "getLevel", MethodType.methodType(int.class));
-            hasExtendedDuration = lookup.findVirtual(potionClass, "hasExtendedDuration", MethodType.methodType(boolean.class));
-            isSplash = lookup.findVirtual(potionClass, "isSplash", MethodType.methodType(boolean.class));
-            potionCtor = lookup.findConstructor(potionClass, MethodType.methodType(void.class, PotionType.class, int.class, boolean.class, boolean.class));
-            toItemStack = lookup.findVirtual(potionClass, "toItemStack", MethodType.methodType(ItemStack.class, int.class));
-            legacyPotionAvailable = true;
-        } catch (ClassNotFoundException | NoSuchMethodException | IllegalAccessException ignored) {
-        }
 
         try {
             ItemMeta.class.getDeclaredMethod("setUnbreakable", boolean.class);
@@ -207,14 +176,6 @@ public final class XItemStack {
         SUPPORTS_ADVANCED_CUSTOM_MODEL_DATA = supportsAdvancedCustomModelData;
         SUPPORTS_ITEM_MODEL = supportsItemModel;
         SUPPORTS_ITEM_NAME = supportsItemName;
-        SUPPORTS_LEGACY_POTION = legacyPotionAvailable;
-        Potion_fromItemStack = fromItemStack;
-        Potion_getType = getType;
-        Potion_getLevel = getLevel;
-        Potion_hasExtendedDuration = hasExtendedDuration;
-        Potion_isSplash = isSplash;
-        Potion_new = potionCtor;
-        Potion_toItemStack = toItemStack;
     }
 
     private interface MetaHandler<M extends ItemMeta> {
@@ -514,6 +475,139 @@ public final class XItemStack {
         return list;
     }
 
+    /**
+     * The base potion of a potion item, read from any of the formats versions save it in, so potions carry over
+     * between versions:
+     * <ul>
+     *     <li>{@code STRONG_HEALING}: the {@link PotionType} of 1.20.5+</li>
+     *     <li>{@code INSTANT_HEAL, false, true}: type, extended, upgraded, from the PotionData of 1.9-1.20.4</li>
+     *     <li>the data value of a pre-1.9 potion, e.g. 16421</li>
+     * </ul>
+     * The type can be a {@link PotionType} name of any version or an effect name.
+     */
+    private static final class BasePotion {
+        private static final int UPGRADED = 0x20, EXTENDED = 0x40, DRINKABLE = 0x2000, SPLASH = 0x4000;
+        /**
+         * The lowest 4 bits of a pre-1.9 potion's data value, by their 1.20.5+ {@link PotionType} names.
+         * Source: v1.8.8 org.bukkit.potion.PotionType
+         */
+        private static final String[] LEGACY_IDS = {
+                null, "REGENERATION", "SWIFTNESS", "FIRE_RESISTANCE", "POISON", "HEALING", "NIGHT_VISION", null,
+                "WEAKNESS", "STRENGTH", "SLOWNESS", "LEAPING", "HARMING", "WATER_BREATHING", "INVISIBILITY", null
+        };
+
+        private final String type;
+        private final boolean extended, upgraded;
+
+        private BasePotion(String type, boolean extended, boolean upgraded) {
+            this.type = type.toUpperCase(Locale.ENGLISH);
+            this.extended = extended;
+            this.upgraded = upgraded;
+        }
+
+        private static BasePotion parse(String str) {
+            if (str.indexOf(',') != -1) {
+                List<String> split = split(str, ',');
+                return new BasePotion(split.isEmpty() ? "" : split.get(0).trim(),
+                        split.size() > 1 && Boolean.parseBoolean(split.get(1).trim()),
+                        split.size() > 2 && Boolean.parseBoolean(split.get(2).trim()));
+            }
+
+            String type = str.trim();
+            if (type.startsWith("STRONG_")) return new BasePotion(type.substring("STRONG_".length()), false, true);
+            if (type.startsWith("LONG_")) return new BasePotion(type.substring("LONG_".length()), true, false);
+            return new BasePotion(type, false, false);
+        }
+
+        /**
+         * @return if this pre-1.9 data value is a potion with an effect.
+         */
+        private static boolean isLegacyPotion(int data) {
+            return LEGACY_IDS[data & 0xF] != null;
+        }
+
+        @Nullable
+        private static BasePotion fromLegacyData(int data) {
+            if (data == 0) return new BasePotion("WATER", false, false);
+
+            int id = data & 0xF;
+            String effect = LEGACY_IDS[id];
+            if (effect != null) return new BasePotion(effect, (data & EXTENDED) != 0, (data & UPGRADED) != 0);
+            if (id != 0) return null;
+
+            // Potions without an effect are named by the rest of the lowest 6 bits.
+            switch (data & 0x3F) {
+                case 16:
+                    return new BasePotion("AWKWARD", false, false);
+                case 32:
+                    return new BasePotion("THICK", false, false);
+                default:
+                    return new BasePotion("MUNDANE", false, false);
+            }
+        }
+
+        /**
+         * @return the pre-1.9 data value of this potion, or -1 if 1.8 has no such potion.
+         */
+        private int toLegacyData(boolean splash) {
+            if (type.isEmpty()) return -1;
+
+            int data;
+            switch (type) {
+                case "WATER":
+                    return splash ? SPLASH : 0;
+                case "AWKWARD":
+                    data = 16;
+                    break;
+                case "THICK":
+                    data = 32;
+                    break;
+                case "MUNDANE":
+                    data = 0;
+                    break;
+                default:
+                    int id = legacyId(type);
+                    if (id == -1) return -1;
+                    data = id | (upgraded ? UPGRADED : 0) | (extended ? EXTENDED : 0);
+            }
+            // Vanilla sets this on every potion that isn't a splash one, Bukkit's Potion class doesn't.
+            return data | (splash ? SPLASH : DRINKABLE);
+        }
+
+        private static int legacyId(String type) {
+            // Also matches the names of other versions (INSTANT_HEAL) and effect names (INSTANT_HEALTH).
+            Optional<XPotion> effect = XPotion.of(type);
+            if (!effect.isPresent()) return -1;
+            for (int id = 0; id < LEGACY_IDS.length; id++) {
+                if (LEGACY_IDS[id] != null && XPotion.of(LEGACY_IDS[id]).orElse(null) == effect.get()) return id;
+            }
+            return -1;
+        }
+
+        /**
+         * @return the name 1.20.5+ saves as "base-type".
+         */
+        @Nullable
+        private String toBaseType() {
+            if (upgraded && extended) return null;
+            return (upgraded ? "STRONG_" : extended ? "LONG_" : "") + type;
+        }
+
+        /**
+         * @return the type on this version, not upgraded or extended.
+         */
+        @Nullable
+        private PotionType getPotionType() {
+            if (type.isEmpty()) return null;
+            try {
+                return PotionType.valueOf(type);
+            } catch (IllegalArgumentException ignored) {
+                // A name from another version, e.g. HEALING and INSTANT_HEAL
+            }
+            return XPotion.of(type).map(XPotion::getPotionType).orElse(null);
+        }
+    }
+
     private static List<String> splitNewLine(String str) {
         int len = str.length();
         List<String> list = new ArrayList<>();
@@ -612,6 +706,7 @@ public final class XItemStack {
             // Pre-1.13: durability encodes potion data, spawn egg type, etc.
             // Save before early return incase pre-1.9 potions have no PotionMeta.
             if (!supports(1, 13)) config.set("damage", item.getDurability());
+            if (!supports(1, 9)) handleLegacyPotion();
 
             if (!item.hasItemMeta()) return;
             meta = item.getItemMeta();
@@ -854,8 +949,27 @@ public final class XItemStack {
                         .method("public org.bukkit.NamespacedKey getKey()")
                         .exists();
 
+        /**
+         * Pre-1.9 the potion is the item's data value. It's saved as the "base-type" of 1.20.5+ instead when that gives
+         * the same data value back, so the potion is saved the same way on every version.
+         */
+        @SuppressWarnings("deprecation")
+        private void handleLegacyPotion() {
+            XMaterial material = XMaterial.matchXMaterial(item);
+            if (material != XMaterial.POTION && material != XMaterial.SPLASH_POTION) return;
+
+            int data = item.getDurability();
+            BasePotion base = BasePotion.fromLegacyData(data);
+            String baseType = base == null ? null : base.toBaseType();
+            if (baseType == null || BasePotion.parse(baseType).toLegacyData(material == XMaterial.SPLASH_POTION) != data) return;
+
+            config.set("damage", null);
+            config.set("base-type", baseType);
+        }
+
         @SuppressWarnings({"deprecation"})
         private void handlePotionMeta(PotionMeta meta) {
+            // Pre-1.9 the base potion is the data value, see handleLegacyPotion()
             if (supports(1, 9)) {
                 if (SUPPORTS_PotionMeta_getBasePotionType) {
                     PotionType basePotionType = meta.getBasePotionType();
@@ -867,39 +981,27 @@ public final class XItemStack {
                     // noinspection removal
                     config.set("base-effect", potionData.getType().name() + ", " + potionData.isExtended() + ", " + potionData.isUpgraded());
                 }
-
-                List<PotionEffect> customEffects = meta.getCustomEffects();
-                if (!customEffects.isEmpty()) {
-                    config.set("effects", customEffects.stream().map(x -> {
-                        String typeStr;
-                        if (SUPPORTS_PotionEffectType_getKey) {
-                            NamespacedKey type = x.getType().getKey();
-                            typeStr = type.getNamespace() + ':' + type.getKey();
-                        } else {
-                            typeStr = x.getType().getName();
-                        }
-
-                        // we change this to match what the deserializer expects
-                        int seconds = x.getDuration() / 20;
-                        int level = x.getAmplifier() + 1;
-                        return typeStr + ", " + seconds + ", " + level;
-                    }).collect(Collectors.toList()));
-                }
-
-                if (SUPPORTS_POTION_COLOR && meta.hasColor()) config.set("color", meta.getColor().asRGB());
-            } else if (SUPPORTS_LEGACY_POTION) {
-                try {
-                    Object potion = Potion_fromItemStack.invoke(item);
-                    PotionType type = (PotionType) Potion_getType.invoke(potion);
-                    int level = (int) Potion_getLevel.invoke(potion);
-                    boolean extended = (boolean) Potion_hasExtendedDuration.invoke(potion);
-                    boolean splash = (boolean) Potion_isSplash.invoke(potion);
-
-                    config.set("level", level);
-                    config.set("base-effect", type.name() + ", " + extended + ", " + splash);
-                } catch (Throwable ignored) {
-                }
             }
+
+            List<PotionEffect> customEffects = meta.getCustomEffects();
+            if (!customEffects.isEmpty()) {
+                config.set("effects", customEffects.stream().map(x -> {
+                    String typeStr;
+                    if (SUPPORTS_PotionEffectType_getKey) {
+                        NamespacedKey type = x.getType().getKey();
+                        typeStr = type.getNamespace() + ':' + type.getKey();
+                    } else {
+                        typeStr = x.getType().getName();
+                    }
+
+                    // we change this to match what the deserializer expects
+                    int seconds = x.getDuration() / 20;
+                    int level = x.getAmplifier() + 1;
+                    return typeStr + ", " + seconds + ", " + level;
+                }).collect(Collectors.toList()));
+            }
+
+            if (SUPPORTS_POTION_COLOR && meta.hasColor()) config.set("color", meta.getColor().asRGB());
         }
 
         private void handleLeatherArmorMeta(LeatherArmorMeta meta) {
@@ -983,15 +1085,11 @@ public final class XItemStack {
             }
         }
 
-        @SuppressWarnings("deprecation")
         private void handleDurability(ItemMeta meta) {
-            if (supports(1, 13)) {
-                if (meta instanceof Damageable) {
-                    Damageable damageable = (Damageable) meta;
-                    if (damageable.hasDamage()) config.set("damage", damageable.getDamage());
-                }
-            } else {
-                config.set("damage", item.getDurability());
+            // Pre-1.13 it's the durability, which serialize() already saved.
+            if (supports(1, 13) && meta instanceof Damageable) {
+                Damageable damageable = (Damageable) meta;
+                if (damageable.hasDamage()) config.set("damage", damageable.getDamage());
             }
         }
     }
@@ -1624,100 +1722,56 @@ public final class XItemStack {
                         .method("public org.bukkit.NamespacedKey getKey()")
                         .exists();
 
+        @SuppressWarnings("deprecation")
         private void handlePotionMeta(ItemMeta meta) {
+            PotionMeta potion = (PotionMeta) meta;
+
+            for (String effects : config.getStringList("effects")) {
+                XPotion.Effect effect = XPotion.parseEffect(effects);
+                if (effect.hasChance()) potion.addCustomEffect(effect.getEffect(), true);
+            }
+
+            if (SUPPORTS_POTION_COLOR && config.contains("color")) {
+                potion.setColor(Color.fromRGB(config.getInt("color")));
+            }
+
+            // 1.9-1.20.4 save the base potion as "base-effect", 1.8 and 1.20.5+ as "base-type". A 1.8 potion that has
+            // no 1.20.5+ name is only its data value, saved as "damage".
+            String baseType = config.getString("base-type");
+            if (Strings.isNullOrEmpty(baseType)) baseType = config.getString("base-effect");
+            int legacyData = config.getInt("damage");
+
             if (supports(1, 9)) {
-                PotionMeta potion = (PotionMeta) meta;
+                BasePotion base = null;
+                if (!Strings.isNullOrEmpty(baseType)) base = BasePotion.parse(baseType);
+                else if (legacyData != 0) base = BasePotion.fromLegacyData(legacyData); // Saved on 1.8
+                if (base != null) setBasePotion(potion, base);
+            } else if (!BasePotion.isLegacyPotion(legacyData) && !Strings.isNullOrEmpty(baseType)) {
+                // Otherwise "damage" is the potion, and handleDurability() already set it.
+                int data = BasePotion.parse(baseType).toLegacyData((item.getDurability() & BasePotion.SPLASH) != 0);
+                if (data != -1) item.setDurability((short) data);
+            }
+        }
 
-                for (String effects : config.getStringList("effects")) {
-                    XPotion.Effect effect = XPotion.parseEffect(effects);
-                    if (effect.hasChance()) potion.addCustomEffect(effect.getEffect(), true);
-                }
+        @SuppressWarnings({"deprecation", "removal"})
+        private static void setBasePotion(PotionMeta meta, BasePotion base) {
+            PotionType type = base.getPotionType();
+            if (type == null) return;
 
-                String baseType = config.getString("base-type");
-                if (!Strings.isNullOrEmpty(baseType)) {
-                    boolean isNewType = !baseType.contains(",");
-
-                    if (SUPPORTS_PotionMeta_setBasePotionType) {
-                        if (isNewType) {
-                            PotionType potionType;
-                            try {
-                                potionType = PotionType.valueOf(baseType);
-                            } catch (IllegalArgumentException ex) {
-                                potionType = PotionType.AWKWARD;
-                            }
-
-                            potion.setBasePotionType(potionType);
-                        } else {
-                            // Format: Type, Extended, Upgraded
-                            String[] components = baseType.split(",");
-
-                            XPotion effect = XPotion.of(components[0]).orElse(XPotion.HEALTH_BOOST);
-                            boolean extended = Boolean.parseBoolean(components[1]);
-                            boolean upgraded = Boolean.parseBoolean(components[2]);
-
-                            String potionTypeStr = effect.getPotionType().name();
-                            if (extended) potionTypeStr = "STRONG_" + potionTypeStr;
-                            else if (upgraded) potionTypeStr = "LONG_" + potionTypeStr;
-
-                            PotionType potionType;
-                            try {
-                                potionType = PotionType.valueOf(potionTypeStr);
-                            } catch (IllegalArgumentException ex) {
-                                potionType = PotionType.AWKWARD;
-                            }
-
-                            potion.setBasePotionType(potionType);
-                        }
-                    } else {
-                        boolean extended = false;
-                        boolean upgraded = false;
-                        PotionType effect;
-
-                        if (isNewType) {
-                            if (baseType.startsWith("STRONG_")) {
-                                extended = true;
-                                baseType = baseType.substring(7);
-                            } else if (baseType.startsWith("LONG_")) {
-                                upgraded = true;
-                                baseType = baseType.substring(5);
-                            }
-
-                            effect = XPotion.of(baseType).orElse(XPotion.HEALTH_BOOST).getPotionType();
-                        } else {
-                            // Format: Type, Extended, Upgraded
-                            String[] components = baseType.split(",");
-
-                            effect = XPotion.of(components[0]).orElse(XPotion.HEALTH_BOOST).getPotionType();
-                            extended = Boolean.parseBoolean(components[1]);
-                            upgraded = Boolean.parseBoolean(components[2]);
-                        }
-
-                        @SuppressWarnings("removal")
-                        org.bukkit.potion.PotionData data = new org.bukkit.potion.PotionData(effect, extended, upgraded);
-                        //noinspection deprecation
-                        potion.setBasePotionData(data);
-                    }
-                }
-
-                if (SUPPORTS_POTION_COLOR && config.contains("color")) {
-                    potion.setColor(Color.fromRGB(config.getInt("color")));
-                }
-            } else if (SUPPORTS_LEGACY_POTION) {
-                String baseEffect = config.getString("base-effect");
-                if (!Strings.isNullOrEmpty(baseEffect)) {
+            if (SUPPORTS_PotionMeta_setBasePotionType) {
+                if (base.upgraded || base.extended) {
                     try {
-                        List<String> split = split(baseEffect, ',');
-                        PotionType type = Enum.valueOf(PotionType.class, split.get(0).trim());
-                        boolean extended = split.size() > 1 && Boolean.parseBoolean(split.get(1).trim());
-                        boolean splash = split.size() > 2 && Boolean.parseBoolean(split.get(2).trim());
-
-                        Object potion = Potion_new.invoke(type, config.getInt("level", 1), splash, extended);
-                        ItemStack result = (ItemStack) Potion_toItemStack.invoke(potion, item.getAmount());
-                        this.item = result;
-                        this.meta = result.getItemMeta();
-                    } catch (Throwable ignored) {
+                        type = PotionType.valueOf((base.upgraded ? "STRONG_" : "LONG_") + type.name());
+                    } catch (IllegalArgumentException ignored) {
+                        // This potion has no stronger or longer version.
                     }
                 }
+                meta.setBasePotionType(type);
+            } else {
+                // PotionData throws if the potion can't be upgraded or extended, or if it's both.
+                boolean upgraded = base.upgraded && type.isUpgradeable();
+                boolean extended = base.extended && !upgraded && type.isExtendable();
+                meta.setBasePotionData(new org.bukkit.potion.PotionData(type, extended, upgraded));
             }
         }
 
@@ -1756,6 +1810,9 @@ public final class XItemStack {
 
         @SuppressWarnings("deprecation")
         private void handleDurability() {
+            // A potion's "damage" is its 1.8 data value, which handlePotionMeta() turns into the base potion.
+            if (supports(1, 9) && meta instanceof PotionMeta) return;
+
             if (supports(1, 13)) {
                 if (meta instanceof Damageable) {
                     int damage = config.getInt("damage");
