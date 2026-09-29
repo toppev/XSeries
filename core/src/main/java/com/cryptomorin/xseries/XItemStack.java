@@ -574,6 +574,15 @@ public final class XItemStack {
             return data | (splash ? SPLASH : DRINKABLE);
         }
 
+        /**
+         * @return the 1.20.5+ name of this potion's type if 1.8 has it too, e.g. HEALING for INSTANT_HEAL.
+         */
+        @Nullable
+        private String modernName() {
+            int id = legacyId(type);
+            return id == -1 ? null : LEGACY_IDS[id];
+        }
+
         private static int legacyId(String type) {
             // Also matches the names of other versions (INSTANT_HEAL) and effect names (INSTANT_HEALTH).
             Optional<XPotion> effect = XPotion.of(type);
@@ -1761,11 +1770,14 @@ public final class XItemStack {
 
             if (SUPPORTS_PotionMeta_setBasePotionType) {
                 if (base.upgraded || base.extended) {
-                    try {
-                        type = PotionType.valueOf((base.upgraded ? "STRONG_" : "LONG_") + type.name());
-                    } catch (IllegalArgumentException ignored) {
-                        // This potion has no stronger or longer version.
-                    }
+                    String prefix = base.upgraded ? "STRONG_" : "LONG_";
+                    // 1.20.2-1.20.4 already name the stronger and longer versions the 1.20.5 way, next to the old
+                    // base names: INSTANT_HEAL and STRONG_HEALING.
+                    String modernName = base.modernName();
+                    PotionType variant = modernName == null ? null : Enums.getIfPresent(PotionType.class, prefix + modernName).orNull();
+                    if (variant == null) variant = Enums.getIfPresent(PotionType.class, prefix + type.name()).orNull();
+                    // Otherwise this potion has no stronger or longer version.
+                    if (variant != null) type = variant;
                 }
                 meta.setBasePotionType(type);
             } else {
