@@ -1067,6 +1067,7 @@ public final class XItemStack {
                     for (Map.Entry<Attribute, AttributeModifier> attribute : attributes.entries()) {
                         String path = "attributes." + XAttribute.of(attribute.getKey()).name() + '.';
                         AttributeModifier modifier = attribute.getValue();
+                        if (isItemFlagDummy(modifier.getName())) continue;
 
                         // config.set(path + "id", modifier.getUniqueId().toString());
                         config.set(path + "name", modifier.getName());
@@ -1109,6 +1110,10 @@ public final class XItemStack {
      */
     public static Deserializer deserializer() {
         return new Deserializer();
+    }
+
+    private static boolean isItemFlagDummy(@Nullable String modifierName) {
+        return "xseries:itemflagdummy".equals(modifierName) || "itemflagdummy".equals(modifierName);
     }
 
     /**
@@ -1242,8 +1247,16 @@ public final class XItemStack {
                     EquipmentSlot slot = section.getString("slot") != null ? Enums.getIfPresent(EquipmentSlot.class, section.getString("slot")).or(EquipmentSlot.HAND) : null;
 
                     String attrName = section.getString("name");
+                    // Written for item flags by older versions, see below
+                    if (isItemFlagDummy(attrName)) continue;
                     if (attrName == null) {
                         attrName = UUID.randomUUID().toString().toLowerCase(Locale.ENGLISH);
+                    } else if (XReflection.supports(1, 21) && NamespacedKey.fromString(attrName) == null) {
+                        // Before 1.21 the name was free text, e.g. "generic.attackSpeed" or "".
+                        attrName = attrName.toLowerCase(Locale.ENGLISH).replaceAll("[^a-z0-9/._:-]", "_");
+                        if (NamespacedKey.fromString(attrName) == null) {
+                            attrName = UUID.randomUUID().toString().toLowerCase(Locale.ENGLISH);
+                        }
                     }
 
                     AttributeModifier modifier = XAttribute.createModifier(
@@ -1257,20 +1270,8 @@ public final class XItemStack {
                 }
             }
 
-            if (!meta.getItemFlags().isEmpty() && XReflection.supports(1, 20, 6)) {
-                // Item flags will not work without an attribute modifier being present.
-                if (!meta.hasAttributeModifiers()) {
-                    meta.addAttributeModifier(
-                            XAttribute.ATTACK_DAMAGE.get(),
-                            XAttribute.createModifier(
-                                    "xseries:itemflagdummy",
-                                    0.0,
-                                    AttributeModifier.Operation.MULTIPLY_SCALAR_1,
-                                    null
-                            )
-                    );
-                }
-            }
+            // No modifier of our own for item flags (HIDE_ATTRIBUTES) anymore: any modifier replaces the
+            // material's defaults, so a sword with any flag did no damage and armor gave no protection.
         }
 
         @SuppressWarnings("deprecation")
